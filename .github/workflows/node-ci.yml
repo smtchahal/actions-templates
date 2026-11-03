@@ -1,0 +1,163 @@
+name: Node CI
+
+on:
+  workflow_call:
+    inputs:
+      commands:
+        description: Shell commands to run after install, one per line. Any failure fails the job.
+        type: string
+        required: true
+      node-version:
+        type: string
+        default: "24"
+      node-version-file:
+        type: string
+        default: ""
+      fetch-depth:
+        description: Use 0 when a command needs full history, such as gitleaks.
+        type: number
+        default: 1
+      audit:
+        description: Fail on high-severity dependency advisories.
+        type: boolean
+        default: false
+      gitleaks:
+        description: Scan for committed secrets. The caller must grant pull-requests read.
+        type: boolean
+        default: false
+      env:
+        description: KEY=VALUE lines exported to the commands, for build-time values such as VITE_*. Callers can interpolate vars but not secrets here; use the BUILD_ENV secret for those.
+        type: string
+        default: ""
+      minimum-release-age:
+        description: Minimum minimumReleaseAge (minutes) the repo's pnpm-workspace.yaml must set. 0 disables the age check.
+        type: number
+        default: 4320
+      dependabot-cooldown-days:
+        description: Minimum cooldown.default-days on every Dependabot update entry. A missing dependabot.yml fails. 0 disables.
+        type: number
+        default: 3
+      artifact-name:
+        description: Upload artifact-path under this name after the commands pass. Empty skips the upload.
+        type: string
+        default: ""
+      artifact-path:
+        type: string
+        default: ""
+    secrets:
+      BUILD_ENV:
+        description: Same format as the env input, for build-time values that come from secrets. Values are masked in logs.
+        required: false
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - if: inputs.dependabot-cooldown-days > 0
+        env:
+          MIN_DAYS: ${{ inputs.dependabot-cooldown-days }}
+        run: |
+          file=
+          for candidate in .github/dependabot.yml .github/dependabot.yaml; do
+            if [ -f "$candidate" ]; then file=$candidate; break; fi
+          done
+          if [ -z "$file" ]; then
+            echo "::error::.github/dependabot.yml is missing"
+            exit 1
+          fi
+          bad=$(yq '[.updates[] | select((.cooldown."default-days" // 0) < env(MIN_DAYS))] | length' "$file")
+          if [ "$bad" != 0 ]; then
+            echo "::error file=$file::$bad update entries have cooldown.default-days below $MIN_DAYS"
+            exit 1
+          fi
+
+      # Age policy lives in the committed file, not a CI env var, so local installs get the same protection.
+      # 11.1.3 is the first pnpm that re-validates lockfile entries against it on frozen installs.
+      - env:
+          MIN_AGE: ${{ inputs.minimum-release-age }}
+        run: |
+          if [ ! -f package.json ]; then
+            echo "::error::package.json is missing"
+            exit 1
+          fi
+          pm=$(yq -o=y '.packageManager // ""' package.json)
+          pm_re='^pnpm@([0-9]+\.[0-9]+\.[0-9]+)(\+[a-z0-9]+\.[0-9a-f]+)?$'
+          if ! [[ $pm =~ $pm_re ]]; then
+            echo "::error file=package.json::packageManager must be pnpm@X.Y.Z with an exact version, got '$pm'"
+            exit 1
+          fi
+          version=${BASH_REMATCH[1]}
+          if [ "$(printf '%s\n' 11.1.3 "$version" | sort -V | head -n 1)" != 11.1.3 ]; then
+            echo "::error file=package.json::pnpm $version is below the required 11.1.3"
+            exit 1
+          fi
+          if [ "$MIN_AGE" -gt 0 ]; then
+            if [ ! -f pnpm-workspace.yaml ]; then
+              echo "::error::pnpm-workspace.yaml is missing; it must set minimumReleaseAge to at least $MIN_AGE"
+              exit 1
+            fi
+            age=$(yq '.minimumReleaseAge // ""' pnpm-workspace.yaml)
+            if ! [[ $age =~ ^[0-9]+$ ]] || [ "$age" -lt "$MIN_AGE" ]; then
+              echo "::error file=pnpm-workspace.yaml::minimumReleaseAge is '$age', required at least $MIN_AGE minutes"
+              exit 1
+            fi
+          fi
+        shell: bash
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          node-version-file: ${{ inputs.node-version-file }}
+          cache: pnpm
+
+      # Frozen installs re-check lockfile entries against minimumReleaseAge, so they must run under the pinned pnpm.
+      - run: |
+          expected=$(yq -o=y '.packageManager' package.json)
+          expected=${expected#pnpm@}
+          expected=${expected%%+*}
+          actual=$(pnpm --version)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::pnpm $actual is active but packageManager pins $expected"
+            exit 1
+          fi
+          pnpm install --frozen-lockfile
+        shell: bash
+
+      # Exported after install so package install scripts never see these values.
+      - env:
+          BUILD_ENV: ${{ inputs.env }}
+          BUILD_ENV_SECRET: ${{ secrets.BUILD_ENV }}
+        run: |
+          [ -n "$BUILD_ENV" ] && printf '%s\n' "$BUILD_ENV" >> "$GITHUB_ENV"
+          if [ -n "$BUILD_ENV_SECRET" ]; then
+            # Per-line masks cover the bare value, which the whole-secret mask would miss.
+            while IFS= read -r line; do
+              [ -n "$line" ] && echo "::add-mask::${line#*=}"
+            done <<< "$BUILD_ENV_SECRET"
+            printf '%s\n' "$BUILD_ENV_SECRET" >> "$GITHUB_ENV"
+          fi
+          exit 0
+
+      - run: ${{ inputs.commands }}
+        shell: bash
+
+      - if: inputs.audit
+        run: pnpm audit --audit-level high
+
+      - if: inputs.gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - if: inputs.artifact-name != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.artifact-path }}
+          if-no-files-found: error

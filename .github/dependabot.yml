@@ -1,0 +1,12 @@
+# Action SHAs are pinned here once for every caller; Dependabot bumps the SHA and the
+# trailing version comment together. Composite actions need their own directory entry.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /setup-node-pnpm
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 3
